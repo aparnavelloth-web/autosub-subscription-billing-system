@@ -13,11 +13,26 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
+from typing import Any, Dict, Optional
 import uuid
 from unittest.mock import patch
 import pytest
 from app.core.config import settings
-from app.models import AuditLog, Customer, Invoice, InvoiceStatus, Payment, PaymentStatus, WebhookEvent
+from app.models import (
+    AuditLog,
+    BillingInterval,
+    Customer,
+    Invoice,
+    InvoiceStatus,
+    Payment,
+    PaymentRefund,
+    PaymentStatus,
+    Plan,
+    RefundStatus,
+    Subscription,
+    SubscriptionStatus,
+    WebhookEvent,
+)
 from app.schemas.payment import MockWebhookPayload
 from app.services.mock_payment_gateway import MockPaymentGateway
 from app.services.payment_service import WebhookService
@@ -553,4 +568,518 @@ def test_webhook_transaction_rollback_on_failure(session_factory):
         assert db_verify.query(AuditLog).count() == 0
     finally:
         db_verify.close()
+
+
+# =====================================================================
+# Milestone 2 Task 3 Webhook Tests:
+# - POST /webhooks/payment endpoint
+# - payment_success, payment_failed, payment_refunded event types
+# - Subscription updates (Active remains Active on success, Active -> Past Due on failure)
+# - Stale and duplicate webhooks never downgrade subscription
+# - Automatic webhook triggering on payment success, failure, and refund
+# - Graceful handling of invalid references and payloads
+# =====================================================================
+
+
+def _seed_subscription_and_invoice(
+    db,
+    *,
+    sub_status: SubscriptionStatus = SubscriptionStatus.ACTIVE,
+    invoice_total: Decimal = Decimal("100.00"),
+    payment_amount: Decimal = Decimal("100.00"),
+    payment_status: Optional[PaymentStatus] = PaymentStatus.PENDING,
+    create_payment: bool = True,
+):
+    tag = _uid()
+    now = datetime.now(timezone.utc)
+    customer = Customer(
+        customer_code=f"WHCUST-{tag}",
+        full_name=f"Webhook User {tag}",
+        email=f"wh.user.{tag.lower()}@example.com",
+        currency="USD",
+    )
+    db.add(customer)
+    db.flush()
+
+    plan = Plan(
+        name=f"Plan {tag}",
+        code=f"PLAN-{tag}",
+        price=invoice_total,
+        currency="USD",
+        billing_interval=BillingInterval.MONTHLY,
+    )
+    db.add(plan)
+    db.flush()
+
+    subscription = Subscription(
+        subscription_code=f"SUB-WH-{tag}",
+        customer_id=customer.id,
+        plan_id=plan.id,
+        status=sub_status,
+        quantity=1,
+        unit_price=invoice_total,
+        currency="USD",
+        billing_interval=BillingInterval.MONTHLY,
+        current_period_start=now,
+        current_period_end=now + timedelta(days=30),
+    )
+    db.add(subscription)
+    db.flush()
+
+    invoice = Invoice(
+        invoice_number=f"INV-WH-{tag}",
+        customer_id=customer.id,
+        subscription_id=subscription.id,
+        subtotal=invoice_total,
+        tax_amount=Decimal("0.00"),
+        discount_amount=Decimal("0.00"),
+        total_amount=invoice_total,
+        amount_paid=Decimal("0.00"),
+        currency="USD",
+        status=InvoiceStatus.OPEN,
+        issue_date=now,
+        due_date=now + timedelta(days=7),
+    )
+    db.add(invoice)
+    db.flush()
+
+    payment = None
+    if create_payment and payment_status is not None:
+        payment = Payment(
+            transaction_reference=f"TXN-WH-{tag}",
+            invoice_id=invoice.id,
+            customer_id=customer.id,
+            amount=payment_amount,
+            refunded_amount=Decimal("0.00"),
+            currency="USD",
+            status=payment_status,
+            payment_date=now if payment_status in (PaymentStatus.SUCCEEDED, PaymentStatus.REFUNDED) else None,
+        )
+        db.add(payment)
+    db.commit()
+    db.refresh(customer)
+    db.refresh(subscription)
+    db.refresh(invoice)
+    if payment is not None:
+        db.refresh(payment)
+    return customer, subscription, invoice, payment
+
+
+def test_root_webhook_payment_success_settles_invoice_and_keeps_subscription_active(api_client, db_session):
+    customer, subscription, invoice, payment = _seed_subscription_and_invoice(
+        db_session,
+        sub_status=SubscriptionStatus.ACTIVE,
+        invoice_total=Decimal("150.00"),
+        payment_amount=Decimal("150.00"),
+        payment_status=PaymentStatus.PENDING,
+    )
+
+    event_id = f"EVT-SUCC-{_uid()}"
+    raw_payload = json.dumps(
+        {
+            "event_id": event_id,
+            "event_type": "payment_success",
+            "transaction_reference": payment.transaction_reference,
+            "amount": "150.00",
+            "currency": "USD",
+        }
+    ).encode("utf-8")
+
+    resp = api_client.post(
+        "/webhooks/payment",
+        content=raw_payload,
+        headers=_signed_headers(raw_payload),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["event_id"] == event_id
+    assert body["event_type"] == "payment_success"
+    assert body["processing_status"] == "processed"
+    assert body["payment_status"] == "succeeded"
+    assert body["invoice_status"] == "paid"
+
+    db_session.expire_all()
+    p_db = db_session.get(Payment, payment.id)
+    i_db = db_session.get(Invoice, invoice.id)
+    s_db = db_session.get(Subscription, subscription.id)
+
+    assert p_db.status == PaymentStatus.SUCCEEDED
+    assert i_db.status == InvoiceStatus.PAID
+    assert i_db.amount_paid == Decimal("150.00")
+    # Subscription must remain Active
+    assert s_db.status == SubscriptionStatus.ACTIVE
+
+
+def test_root_webhook_payment_failed_transitions_subscription_to_past_due(api_client, db_session):
+    customer, subscription, invoice, payment = _seed_subscription_and_invoice(
+        db_session,
+        sub_status=SubscriptionStatus.ACTIVE,
+        invoice_total=Decimal("200.00"),
+        payment_amount=Decimal("200.00"),
+        payment_status=PaymentStatus.PENDING,
+    )
+
+    event_id = f"EVT-FAIL-{_uid()}"
+    raw_payload = json.dumps(
+        {
+            "event_id": event_id,
+            "event_type": "payment_failed",
+            "transaction_reference": payment.transaction_reference,
+            "failure_reason": "Card declined by issuer",
+        }
+    ).encode("utf-8")
+
+    resp = api_client.post(
+        "/webhooks/payment",
+        content=raw_payload,
+        headers=_signed_headers(raw_payload),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["event_id"] == event_id
+    assert body["event_type"] == "payment_failed"
+    assert body["processing_status"] == "processed"
+    assert body["payment_status"] == "failed"
+    assert body["invoice_status"] == "open"
+    assert body["subscription_status"] == "past_due"
+
+    db_session.expire_all()
+    p_db = db_session.get(Payment, payment.id)
+    i_db = db_session.get(Invoice, invoice.id)
+    s_db = db_session.get(Subscription, subscription.id)
+
+    assert p_db.status == PaymentStatus.FAILED
+    assert i_db.status == InvoiceStatus.OPEN
+    assert i_db.amount_paid == Decimal("0.00")
+    # Subscription transitions from Active -> Past Due
+    assert s_db.status == SubscriptionStatus.PAST_DUE
+
+    sub_audit = (
+        db_session.query(AuditLog)
+        .filter(
+            AuditLog.entity_type == "subscription",
+            AuditLog.entity_id == subscription.id,
+            AuditLog.action == "subscription.past_due",
+        )
+        .first()
+    )
+    assert sub_audit is not None
+    assert sub_audit.old_values["status"] == "active"
+    assert sub_audit.new_values["status"] == "past_due"
+
+
+def test_root_webhook_payment_refunded_settles_refund(api_client, db_session):
+    tag = _uid()
+    now = datetime.now(timezone.utc)
+    customer = Customer(
+        customer_code=f"WHCUST-{tag}",
+        full_name=f"Refund User {tag}",
+        email=f"rf.user.{tag.lower()}@example.com",
+        currency="USD",
+    )
+    db_session.add(customer)
+    db_session.flush()
+
+    invoice = Invoice(
+        invoice_number=f"INV-RF-{tag}",
+        customer_id=customer.id,
+        subtotal=Decimal("100.00"),
+        tax_amount=Decimal("0.00"),
+        discount_amount=Decimal("0.00"),
+        total_amount=Decimal("100.00"),
+        amount_paid=Decimal("100.00"),
+        currency="USD",
+        status=InvoiceStatus.PAID,
+        issue_date=now,
+        due_date=now + timedelta(days=7),
+        paid_at=now,
+    )
+    db_session.add(invoice)
+    db_session.flush()
+
+    payment = Payment(
+        transaction_reference=f"TXN-RF-{tag}",
+        invoice_id=invoice.id,
+        customer_id=customer.id,
+        amount=Decimal("100.00"),
+        refunded_amount=Decimal("0.00"),
+        currency="USD",
+        status=PaymentStatus.SUCCEEDED,
+        payment_date=now,
+    )
+    db_session.add(payment)
+    db_session.flush()
+
+    refund = PaymentRefund(
+        refund_reference=f"REF-RF-{tag}",
+        payment_id=payment.id,
+        invoice_id=invoice.id,
+        customer_id=customer.id,
+        amount=Decimal("100.00"),
+        currency="USD",
+        status=RefundStatus.PENDING,
+    )
+    db_session.add(refund)
+    db_session.commit()
+
+    event_id = f"EVT-REF-{_uid()}"
+    raw_payload = json.dumps(
+        {
+            "event_id": event_id,
+            "event_type": "payment_refunded",
+            "transaction_reference": payment.transaction_reference,
+            "refund_reference": refund.refund_reference,
+            "amount": "100.00",
+            "currency": "USD",
+        }
+    ).encode("utf-8")
+
+    resp = api_client.post(
+        "/webhooks/payment",
+        content=raw_payload,
+        headers=_signed_headers(raw_payload),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["event_id"] == event_id
+    assert body["event_type"] == "payment_refunded"
+    assert body["processing_status"] == "processed"
+    assert body["refund_status"] == "succeeded"
+
+    db_session.expire_all()
+    rf_db = db_session.get(PaymentRefund, refund.id)
+    p_db = db_session.get(Payment, payment.id)
+    i_db = db_session.get(Invoice, invoice.id)
+
+    assert rf_db.status == RefundStatus.SUCCEEDED
+    assert p_db.refunded_amount == Decimal("100.00")
+    assert p_db.status == PaymentStatus.REFUNDED
+    # Historical invoice amount_paid is preserved
+    assert i_db.amount_paid == Decimal("100.00")
+    assert i_db.status == InvoiceStatus.PAID
+
+
+def test_automatic_webhook_triggered_on_payment_process_success(api_client, db_session):
+    _, _, invoice, _ = _seed_subscription_and_invoice(
+        db_session,
+        sub_status=SubscriptionStatus.ACTIVE,
+        invoice_total=Decimal("80.00"),
+        create_payment=False,
+    )
+
+    # random_value=0.05 -> deterministic success (< 0.80)
+    res = api_client.post(
+        "/payments/process",
+        json={"invoice_id": invoice.id, "amount": "80.00", "random_value": 0.05},
+    )
+    assert res.status_code == 201
+    pay_data = res.json()
+    assert pay_data["status"] == "succeeded"
+    txn_ref = pay_data["transaction_reference"]
+
+    # Verify automatic webhook was recorded in database
+    db_session.expire_all()
+    auto_evt = (
+        db_session.query(WebhookEvent)
+        .filter(
+            WebhookEvent.transaction_reference == txn_ref,
+            WebhookEvent.event_type == "payment_success",
+        )
+        .first()
+    )
+    assert auto_evt is not None
+    assert auto_evt.processing_status == "processed"
+    assert auto_evt.signature_verified is True
+    assert auto_evt.payload["status"] == "succeeded"
+
+
+def test_automatic_webhook_triggered_on_payment_process_failure_and_past_due(api_client, db_session):
+    _, subscription, invoice, _ = _seed_subscription_and_invoice(
+        db_session,
+        sub_status=SubscriptionStatus.ACTIVE,
+        invoice_total=Decimal("95.00"),
+        create_payment=False,
+    )
+
+    # random_value=0.95 -> deterministic failure (>= 0.80)
+    res = api_client.post(
+        "/payments/process",
+        json={"invoice_id": invoice.id, "amount": "95.00", "random_value": 0.95},
+    )
+    assert res.status_code == 201
+    pay_data = res.json()
+    assert pay_data["status"] == "failed"
+    txn_ref = pay_data["transaction_reference"]
+
+    db_session.expire_all()
+    # Subscription must have transitioned from Active -> Past Due
+    s_db = db_session.get(Subscription, subscription.id)
+    assert s_db.status == SubscriptionStatus.PAST_DUE
+
+    # Verify automatic webhook event was recorded in database
+    auto_evt = (
+        db_session.query(WebhookEvent)
+        .filter(
+            WebhookEvent.transaction_reference == txn_ref,
+            WebhookEvent.event_type == "payment_failed",
+        )
+        .first()
+    )
+    assert auto_evt is not None
+    assert auto_evt.processing_status == "processed"
+    assert auto_evt.signature_verified is True
+    assert auto_evt.payload["status"] == "failed"
+
+
+def test_automatic_webhook_triggered_on_refund_completion(api_client, db_session):
+    tag = _uid()
+    now = datetime.now(timezone.utc)
+    customer = Customer(
+        customer_code=f"WHCUST-{tag}",
+        full_name=f"Auto Refund User {tag}",
+        email=f"auto.rf.{tag.lower()}@example.com",
+        currency="USD",
+    )
+    db_session.add(customer)
+    db_session.flush()
+
+    invoice = Invoice(
+        invoice_number=f"INV-AUTORF-{tag}",
+        customer_id=customer.id,
+        subtotal=Decimal("50.00"),
+        tax_amount=Decimal("0.00"),
+        discount_amount=Decimal("0.00"),
+        total_amount=Decimal("50.00"),
+        amount_paid=Decimal("50.00"),
+        currency="USD",
+        status=InvoiceStatus.PAID,
+        issue_date=now,
+        due_date=now + timedelta(days=7),
+        paid_at=now,
+    )
+    db_session.add(invoice)
+    db_session.flush()
+
+    payment = Payment(
+        transaction_reference=f"TXN-AUTORF-{tag}",
+        invoice_id=invoice.id,
+        customer_id=customer.id,
+        amount=Decimal("50.00"),
+        refunded_amount=Decimal("0.00"),
+        currency="USD",
+        status=PaymentStatus.SUCCEEDED,
+        payment_date=now,
+    )
+    db_session.add(payment)
+    db_session.commit()
+
+    # Call refund endpoint
+    resp = api_client.post(
+        f"/api/v1/payments/{payment.id}/refund",
+        json={"amount": "50.00", "reason": "Customer cancellation"},
+    )
+    assert resp.status_code == 201
+    refund_data = resp.json()
+    assert refund_data["status"] == "succeeded"
+    rf_ref = refund_data["refund_reference"]
+
+    # Verify automatic refund webhook was recorded in database
+    db_session.expire_all()
+    auto_evt = (
+        db_session.query(WebhookEvent)
+        .filter(
+            WebhookEvent.transaction_reference == payment.transaction_reference,
+            WebhookEvent.event_type == "payment_refunded",
+        )
+        .first()
+    )
+    assert auto_evt is not None
+    assert auto_evt.processing_status == "processed"
+    assert auto_evt.payload["refund_reference"] == rf_ref
+
+
+def test_stale_and_duplicate_failure_webhooks_never_downgrade_subscription(api_client, db_session):
+    _, subscription, invoice, payment = _seed_subscription_and_invoice(
+        db_session,
+        sub_status=SubscriptionStatus.ACTIVE,
+        invoice_total=Decimal("60.00"),
+        payment_amount=Decimal("60.00"),
+        payment_status=PaymentStatus.SUCCEEDED,
+    )
+
+    event_id = f"EVT-STALE-{_uid()}"
+    raw_payload = json.dumps(
+        {
+            "event_id": event_id,
+            "event_type": "payment_failed",
+            "transaction_reference": payment.transaction_reference,
+            "failure_reason": "Belated gateway error",
+        }
+    ).encode("utf-8")
+
+    # 1. Stale failure arriving for a SUCCEEDED payment
+    resp1 = api_client.post(
+        "/webhooks/payment",
+        content=raw_payload,
+        headers=_signed_headers(raw_payload),
+    )
+    assert resp1.status_code == 200
+    assert resp1.json()["processing_status"] == "ignored_stale"
+    assert resp1.json()["payment_status"] == "succeeded"
+
+    db_session.expire_all()
+    # Subscription must NOT be downgraded!
+    assert db_session.get(Subscription, subscription.id).status == SubscriptionStatus.ACTIVE
+    assert db_session.get(Payment, payment.id).status == PaymentStatus.SUCCEEDED
+
+    # 2. Duplicate delivery of the same webhook
+    resp2 = api_client.post(
+        "/webhooks/payment",
+        content=raw_payload,
+        headers=_signed_headers(raw_payload),
+    )
+    assert resp2.status_code == 200
+    assert resp2.json()["duplicate"] is True
+    assert db_session.get(Subscription, subscription.id).status == SubscriptionStatus.ACTIVE
+
+
+def test_webhook_payment_endpoint_invalid_payload_and_missing_reference(api_client, db_session):
+    # 1. Invalid signature -> 401
+    bad_sig_headers = {"Content-Type": "application/json", "X-Mock-Signature": "t=123,v1=invalid"}
+    res_401 = api_client.post(
+        "/webhooks/payment",
+        content=b'{"event_id": "EVT-1", "event_type": "payment_success"}',
+        headers=bad_sig_headers,
+    )
+    assert res_401.status_code == 401
+
+    # 2. Missing required transaction reference -> 422
+    payload_no_ref = json.dumps(
+        {
+            "event_id": f"EVT-NOREF-{_uid()}",
+            "event_type": "payment_success",
+        }
+    ).encode("utf-8")
+    res_422 = api_client.post(
+        "/webhooks/payment",
+        content=payload_no_ref,
+        headers=_signed_headers(payload_no_ref),
+    )
+    assert res_422.status_code == 422
+
+    # 3. Non-existent payment reference -> 404
+    payload_404 = json.dumps(
+        {
+            "event_id": f"EVT-404-{_uid()}",
+            "event_type": "payment_success",
+            "transaction_reference": "TXN-NONEXISTENT-9999",
+        }
+    ).encode("utf-8")
+    res_404 = api_client.post(
+        "/webhooks/payment",
+        content=payload_404,
+        headers=_signed_headers(payload_404),
+    )
+    assert res_404.status_code == 404
+
 

@@ -5,6 +5,7 @@ import InvoicesManager from './InvoicesManager';
 import SubscriptionsManager from './SubscriptionsManager';
 import PlansManager from './PlansManager';
 import CustomersManager from './CustomersManager';
+import PaymentsManager from './PaymentsManager';
 
 export default function Dashboard({ user, onLogout }) {
   const [profile, setProfile] = useState(user);
@@ -53,6 +54,7 @@ export default function Dashboard({ user, onLogout }) {
         {activeTab === 'subscriptions' && <SubscriptionsManager />}
         {activeTab === 'plans' && <PlansManager />}
         {activeTab === 'customers' && <CustomersManager />}
+        {activeTab === 'payments' && <PaymentsManager />}
 
         {activeTab === 'overview' && (
           <div className="overview-container">
@@ -209,7 +211,7 @@ export default function Dashboard({ user, onLogout }) {
         )}
 
         {/* Other Module Placeholder Views */}
-        {activeTab !== 'invoices' && activeTab !== 'subscriptions' && activeTab !== 'plans' && activeTab !== 'customers' && activeTab !== 'overview' && (
+        {activeTab !== 'invoices' && activeTab !== 'subscriptions' && activeTab !== 'plans' && activeTab !== 'customers' && activeTab !== 'payments' && activeTab !== 'overview' && (
           <div className="module-placeholder-view">
             <div className="dashboard-hero">
               <div className="dashboard-hero-content">

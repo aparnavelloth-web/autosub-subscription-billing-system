@@ -1,17 +1,27 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { invoiceService } from '../services/invoices';
+import { paymentsService } from '../services/payments';
 
-export default function InvoiceDetailModal({ invoice, isOpen, onClose }) {
+export default function InvoiceDetailModal({ invoice, isOpen, onClose, onPaymentCompleted }) {
+  const [currentInvoice, setCurrentInvoice] = useState(invoice);
   const [downloading, setDownloading] = useState(false);
   const [downloadError, setDownloadError] = useState('');
+  const [processingPayment, setProcessingPayment] = useState(false);
+  const [paymentFeedback, setPaymentFeedback] = useState(null);
 
-  if (!isOpen || !invoice) return null;
+  useEffect(() => {
+    setCurrentInvoice(invoice);
+    setPaymentFeedback(null);
+    setDownloadError('');
+  }, [invoice]);
+
+  if (!isOpen || !currentInvoice) return null;
 
   const handleDownloadPdf = async () => {
     try {
       setDownloading(true);
       setDownloadError('');
-      await invoiceService.downloadInvoicePdf(invoice.id, invoice.invoice_number);
+      await invoiceService.downloadInvoicePdf(currentInvoice.id, currentInvoice.invoice_number);
     } catch (err) {
       setDownloadError(err.message || 'Failed to download PDF statement.');
     } finally {
@@ -19,14 +29,54 @@ export default function InvoiceDetailModal({ invoice, isOpen, onClose }) {
     }
   };
 
-  const statusStr = (invoice.status || 'open').toUpperCase();
+  const handleProcessPayment = async () => {
+    try {
+      setProcessingPayment(true);
+      setPaymentFeedback(null);
+      const res = await paymentsService.processPayment({ invoice_id: currentInvoice.id });
+
+      if (res.status === 'succeeded') {
+        setPaymentFeedback({
+          type: 'success',
+          message: `Payment successful! Transaction reference: ${res.transaction_reference}. Invoice settled.`,
+        });
+      } else if (res.status === 'failed') {
+        setPaymentFeedback({
+          type: 'error',
+          message: `Payment failed: ${res.failure_reason || 'Card declined by simulation engine'}. Associated subscription moved to Past Due.`,
+        });
+      } else {
+        setPaymentFeedback({
+          type: 'info',
+          message: `Payment status: ${res.status}. Reference: ${res.transaction_reference}.`,
+        });
+      }
+
+      // Re-fetch fresh invoice record from backend
+      const fresh = await invoiceService.getInvoice(currentInvoice.id);
+      setCurrentInvoice(fresh);
+
+      if (onPaymentCompleted) {
+        onPaymentCompleted(fresh);
+      }
+    } catch (err) {
+      setPaymentFeedback({
+        type: 'error',
+        message: err.message || 'Payment processing failed.',
+      });
+    } finally {
+      setProcessingPayment(false);
+    }
+  };
+
+  const statusStr = (currentInvoice.status || 'open').toUpperCase();
   const isPaid = statusStr === 'PAID';
-  const subtotal = parseFloat(invoice.subtotal || 0).toFixed(2);
-  const tax = parseFloat(invoice.tax_amount || 0).toFixed(2);
-  const discount = parseFloat(invoice.discount_amount || 0).toFixed(2);
-  const total = parseFloat(invoice.total_amount || 0).toFixed(2);
-  const amountPaid = parseFloat(invoice.amount_paid || 0).toFixed(2);
-  const balance = Math.max(0, parseFloat(invoice.total_amount || 0) - parseFloat(invoice.amount_paid || 0)).toFixed(2);
+  const subtotal = parseFloat(currentInvoice.subtotal || 0).toFixed(2);
+  const tax = parseFloat(currentInvoice.tax_amount || 0).toFixed(2);
+  const discount = parseFloat(currentInvoice.discount_amount || 0).toFixed(2);
+  const total = parseFloat(currentInvoice.total_amount || 0).toFixed(2);
+  const amountPaid = parseFloat(currentInvoice.amount_paid || 0).toFixed(2);
+  const balance = Math.max(0, parseFloat(currentInvoice.total_amount || 0) - parseFloat(currentInvoice.amount_paid || 0)).toFixed(2);
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -45,7 +95,7 @@ export default function InvoiceDetailModal({ invoice, isOpen, onClose }) {
             <div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
                 <h2 className="modal-title" style={{ fontFamily: 'var(--font-mono, monospace)' }}>
-                  {invoice.invoice_number}
+                  {currentInvoice.invoice_number}
                 </h2>
                 <span className={`status-pill ${isPaid ? 'online' : 'offline'}`}>
                   <span className="status-dot"></span>
@@ -67,37 +117,57 @@ export default function InvoiceDetailModal({ invoice, isOpen, onClose }) {
           </div>
         )}
 
+        {paymentFeedback && (
+          <div
+            className={`auth-alert ${paymentFeedback.type === 'success' ? 'success' : 'error'}`}
+            style={{ margin: '0.75rem 1.5rem', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+              <span>{paymentFeedback.type === 'success' ? '✓' : '⚠️'}</span>
+              <span>{paymentFeedback.message}</span>
+            </div>
+            <button
+              type="button"
+              className="btn-secondary"
+              onClick={() => setPaymentFeedback(null)}
+              style={{ padding: '0.2rem 0.5rem', fontSize: '0.75rem' }}
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+
         {/* Modal Body */}
         <div className="invoice-modal-body">
           {/* Metadata Columns */}
           <div className="invoice-details-grid">
             <div className="invoice-info-card">
               <span className="invoice-info-label">BILLED CUSTOMER</span>
-              <div className="invoice-info-val-strong">{invoice.customer_name || 'Customer'}</div>
-              <div className="invoice-info-sub">{invoice.customer_email || 'N/A'}</div>
-              <div className="invoice-info-sub">Customer ID: #{invoice.customer_id}</div>
+              <div className="invoice-info-val-strong">{currentInvoice.customer_name || 'Customer'}</div>
+              <div className="invoice-info-sub">{currentInvoice.customer_email || 'N/A'}</div>
+              <div className="invoice-info-sub">Customer ID: #{currentInvoice.customer_id}</div>
             </div>
 
             <div className="invoice-info-card">
               <span className="invoice-info-label">SUBSCRIPTION PLAN</span>
-              <div className="invoice-info-val-strong">{invoice.plan_name || 'Standard Tier'}</div>
-              <div className="invoice-info-sub">Plan Code: {invoice.plan_code || 'N/A'}</div>
-              <div className="invoice-info-sub">Subscription ID: #{invoice.subscription_id || 'Direct'}</div>
+              <div className="invoice-info-val-strong">{currentInvoice.plan_name || 'Standard Tier'}</div>
+              <div className="invoice-info-sub">Plan Code: {currentInvoice.plan_code || 'N/A'}</div>
+              <div className="invoice-info-sub">Subscription ID: #{currentInvoice.subscription_id || 'Direct'}</div>
             </div>
 
             <div className="invoice-info-card">
               <span className="invoice-info-label">DATES & TIMELINE</span>
               <div className="invoice-info-row">
                 <span>Issue Date:</span>
-                <strong>{invoice.issue_date ? new Date(invoice.issue_date).toLocaleDateString() : 'N/A'}</strong>
+                <strong>{currentInvoice.issue_date ? new Date(currentInvoice.issue_date).toLocaleDateString() : 'N/A'}</strong>
               </div>
               <div className="invoice-info-row">
                 <span>Due Date:</span>
-                <strong>{invoice.due_date ? new Date(invoice.due_date).toLocaleDateString() : 'N/A'}</strong>
+                <strong>{currentInvoice.due_date ? new Date(currentInvoice.due_date).toLocaleDateString() : 'N/A'}</strong>
               </div>
               <div className="invoice-info-row">
                 <span>Settled At:</span>
-                <strong>{invoice.paid_at ? new Date(invoice.paid_at).toLocaleString() : 'Unpaid'}</strong>
+                <strong>{currentInvoice.paid_at ? new Date(currentInvoice.paid_at).toLocaleString() : 'Unpaid'}</strong>
               </div>
             </div>
           </div>
@@ -117,8 +187,8 @@ export default function InvoiceDetailModal({ invoice, isOpen, onClose }) {
                   </tr>
                 </thead>
                 <tbody>
-                  {(invoice.items && invoice.items.length > 0) ? (
-                    invoice.items.map((item, idx) => (
+                  {(currentInvoice.items && currentInvoice.items.length > 0) ? (
+                    currentInvoice.items.map((item, idx) => (
                       <tr key={item.id || idx}>
                         <td style={{ fontWeight: 500 }}>{item.description}</td>
                         <td>
@@ -126,17 +196,17 @@ export default function InvoiceDetailModal({ invoice, isOpen, onClose }) {
                         </td>
                         <td style={{ textAlign: 'center' }}>{item.quantity}</td>
                         <td style={{ textAlign: 'right', fontFamily: 'monospace' }}>
-                          {invoice.currency} {parseFloat(item.unit_price).toFixed(2)}
+                          {currentInvoice.currency} {parseFloat(item.unit_price).toFixed(2)}
                         </td>
                         <td style={{ textAlign: 'right', fontWeight: 600, fontFamily: 'monospace' }}>
-                          {invoice.currency} {parseFloat(item.amount).toFixed(2)}
+                          {currentInvoice.currency} {parseFloat(item.amount).toFixed(2)}
                         </td>
                       </tr>
                     ))
                   ) : (
                     <tr>
                       <td colSpan="5" style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '1.25rem' }}>
-                        Base recurring charge ({invoice.currency} {subtotal})
+                        Base recurring charge ({currentInvoice.currency} {subtotal})
                       </td>
                     </tr>
                   )}
@@ -149,36 +219,36 @@ export default function InvoiceDetailModal({ invoice, isOpen, onClose }) {
           <div className="invoice-financial-summary">
             <div className="invoice-notes-box">
               <span className="invoice-info-label">INVOICE NOTES & TERMS</span>
-              <p>{invoice.notes || 'Payment terms: Due on specified due date. Automated recurring billing managed via AutoSub engine.'}</p>
+              <p>{currentInvoice.notes || 'Payment terms: Due on specified due date. Automated recurring billing managed via AutoSub engine.'}</p>
             </div>
 
             <div className="invoice-totals-box">
               <div className="invoice-tot-row">
                 <span>Subtotal:</span>
-                <span>{invoice.currency} {subtotal}</span>
+                <span>{currentInvoice.currency} {subtotal}</span>
               </div>
               {parseFloat(discount) > 0 && (
                 <div className="invoice-tot-row" style={{ color: '#10b981' }}>
                   <span>Discount / Credits:</span>
-                  <span>-{invoice.currency} {discount}</span>
+                  <span>-{currentInvoice.currency} {discount}</span>
                 </div>
               )}
               <div className="invoice-tot-row">
                 <span>Tax:</span>
-                <span>{invoice.currency} {tax}</span>
+                <span>{currentInvoice.currency} {tax}</span>
               </div>
               <div className="invoice-tot-row grand-total">
                 <span>Total Amount:</span>
-                <span className="gradient-text">{invoice.currency} {total}</span>
+                <span className="gradient-text">{currentInvoice.currency} {total}</span>
               </div>
               <div className="invoice-tot-row">
                 <span>Amount Paid:</span>
-                <span>{invoice.currency} {amountPaid}</span>
+                <span>{currentInvoice.currency} {amountPaid}</span>
               </div>
               <div className="invoice-tot-row balance-due">
                 <span>Outstanding Balance:</span>
                 <span style={{ color: parseFloat(balance) > 0 ? '#ef4444' : '#34d399' }}>
-                  {invoice.currency} {balance}
+                  {currentInvoice.currency} {balance}
                 </span>
               </div>
             </div>
@@ -186,20 +256,34 @@ export default function InvoiceDetailModal({ invoice, isOpen, onClose }) {
         </div>
 
         {/* Modal Footer Actions */}
-        <div className="modal-footer" style={{ padding: '1rem 1.5rem', display: 'flex', justifyContent: 'space-between', borderTop: '1px solid var(--border-color)' }}>
-          <button
-            type="button"
-            className="btn-primary"
-            onClick={handleDownloadPdf}
-            disabled={downloading}
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: '0.45rem' }}>
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-              <polyline points="7 10 12 15 17 10" />
-              <line x1="12" x2="12" y1="15" y2="3" />
-            </svg>
-            {downloading ? 'Generating PDF...' : 'Download PDF Statement'}
-          </button>
+        <div className="modal-footer" style={{ padding: '1rem 1.5rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderTop: '1px solid var(--border-color)' }}>
+          <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
+            {!isPaid && (
+              <button
+                type="button"
+                className="btn-primary"
+                style={{ background: '#10b981', borderColor: '#059669' }}
+                onClick={handleProcessPayment}
+                disabled={processingPayment}
+              >
+                {processingPayment ? 'Processing Payment...' : '💳 Process Payment'}
+              </button>
+            )}
+
+            <button
+              type="button"
+              className="btn-primary"
+              onClick={handleDownloadPdf}
+              disabled={downloading}
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: '0.45rem' }}>
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="7 10 12 15 17 10" />
+                <line x1="12" x2="12" y1="15" y2="3" />
+              </svg>
+              {downloading ? 'Generating PDF...' : 'Download PDF Statement'}
+            </button>
+          </div>
 
           <button type="button" className="btn-secondary" onClick={onClose}>
             Close

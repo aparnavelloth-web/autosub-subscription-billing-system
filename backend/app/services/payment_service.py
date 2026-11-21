@@ -1,23 +1,30 @@
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
+import logging
 from typing import Any, Dict, List, Optional, Tuple
+import uuid
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 from app.models.audit_log import AuditLog
 from app.models.customer import Customer
-from app.models.enums import InvoiceStatus, PaymentMethod, PaymentStatus, RefundStatus
+from app.models.enums import InvoiceStatus, PaymentMethod, PaymentStatus, RefundStatus, SubscriptionStatus
 from app.models.invoice import Invoice
 from app.models.payment import Payment, PaymentRefund, WebhookEvent
+from app.models.subscription import Subscription
 from app.schemas.payment import (
+    MockPaymentOutcome,
     MockWebhookEventType,
     MockWebhookPayload,
     PaymentInitiateRequest,
+    PaymentProcessRequest,
     PaymentRefundRequest,
     WebhookProcessResponse,
 )
 from app.services.invoice_service import InvoiceNotFoundError, InvoiceService
 from app.services.mock_payment_gateway import MockPaymentGateway
+
+logger = logging.getLogger("subscription_billing.payment_service")
 
 
 class PaymentNotFoundError(Exception):
@@ -54,6 +61,17 @@ def _serialize_payment(payment: Payment) -> Dict[str, Any]:
         "status": payment.status.value if payment.status else None,
         "payment_date": payment.payment_date.isoformat() if payment.payment_date else None,
         "failure_reason": payment.failure_reason,
+    }
+
+
+def _serialize_subscription(sub: Subscription) -> Dict[str, Any]:
+    return {
+        "id": sub.id,
+        "subscription_code": sub.subscription_code,
+        "customer_id": sub.customer_id,
+        "plan_id": sub.plan_id,
+        "status": sub.status.value if sub.status else None,
+        "currency": sub.currency,
     }
 
 
@@ -206,12 +224,17 @@ class PaymentService:
                 f"{available_uncommitted} {invoice.currency} due to pending payment(s)."
             )
 
+        outcome = payload.simulate_outcome
+        if outcome is None or outcome == MockPaymentOutcome.AUTO:
+            rand_val = getattr(payload, "random_value", None)
+            outcome = MockPaymentGateway.determine_automatic_outcome(random_value=rand_val)
+
         gateway_result = MockPaymentGateway.charge(
             amount=charge_amount,
             currency=invoice.currency,
             payment_method=payload.payment_method,
             transaction_reference=payload.transaction_reference,
-            outcome=payload.simulate_outcome,
+            outcome=outcome,
             failure_reason=payload.failure_reason,
         )
 
@@ -246,6 +269,35 @@ class PaymentService:
                     f"Payment '{payment.transaction_reference}' failed for invoice "
                     f"'{invoice.invoice_number}': {payment.failure_reason}"
                 )
+                # Failed payment: subscription transitions from Active to Past Due
+                if invoice.subscription_id:
+                    sub = (
+                        db.query(Subscription)
+                        .filter(Subscription.id == invoice.subscription_id)
+                        .populate_existing()
+                        .with_for_update()
+                        .first()
+                    )
+                    if sub is not None and sub.status == SubscriptionStatus.ACTIVE:
+                        old_sub = _serialize_subscription(sub)
+                        sub.status = SubscriptionStatus.PAST_DUE
+                        db.flush()
+                        db.add(
+                            AuditLog(
+                                entity_type="subscription",
+                                entity_id=sub.id,
+                                action="subscription.past_due",
+                                actor=actor,
+                                customer_id=sub.customer_id,
+                                old_values=old_sub,
+                                new_values=_serialize_subscription(sub),
+                                ip_address=ip_address,
+                                description=(
+                                    f"Subscription '{sub.subscription_code}' transitioned to 'past_due' "
+                                    f"due to failed payment attempt '{payment.transaction_reference}'."
+                                ),
+                            )
+                        )
             else:
                 payment_action = "payment.initiated"
                 payment_desc = (
@@ -315,7 +367,20 @@ class PaymentService:
             ) from exc
 
         db.refresh(payment)
+        db.refresh(invoice)
         _ = payment.refunds
+        _ = payment.invoice
+        _ = payment.customer
+
+        # Automatic Webhook Triggering (Milestone 2 Task 3)
+        PaymentService._trigger_automatic_payment_webhook(
+            db=db,
+            payment=payment,
+            invoice=invoice,
+            actor=actor,
+            ip_address=ip_address,
+        )
+
         return payment, True
 
     @staticmethod
@@ -584,7 +649,172 @@ class PaymentService:
         db.refresh(refund)
         db.refresh(payment)
         db.refresh(invoice)
+
+        # Automatic Webhook Triggering (Milestone 2 Task 3)
+        PaymentService._trigger_automatic_refund_webhook(
+            db=db,
+            payment=payment,
+            refund=refund,
+            invoice=invoice,
+            actor=actor,
+            ip_address=ip_address,
+        )
+
         return refund, True
+
+    @staticmethod
+    def _trigger_automatic_payment_webhook(
+        db: Session,
+        payment: Payment,
+        invoice: Invoice,
+        actor: str = "payment_processor",
+        ip_address: Optional[str] = None,
+    ) -> Optional[WebhookEvent]:
+        """
+        Automatically records and dispatches a verified webhook event after payment processing.
+        payment_success for SUCCEEDED, payment_failed for FAILED.
+        Runs safely in its own try/except so that any error in webhook recording NEVER rolls back
+        or corrupts the already committed payment transaction.
+        """
+        if payment.status not in (PaymentStatus.SUCCEEDED, PaymentStatus.FAILED):
+            return None
+
+        event_type = (
+            MockWebhookEventType.PAYMENT_SUCCESS.value
+            if payment.status == PaymentStatus.SUCCEEDED
+            else MockWebhookEventType.PAYMENT_FAILED_UNDERSCORE.value
+        )
+        event_id = f"EVT-AUTO-{uuid.uuid4().hex[:12].upper()}"
+        now = datetime.now(timezone.utc)
+        payload_dict = {
+            "event_id": event_id,
+            "event_type": event_type,
+            "transaction_reference": payment.transaction_reference,
+            "amount": str(payment.amount),
+            "currency": payment.currency,
+            "status": payment.status.value,
+            "gateway_data": payment.gateway_response or {},
+        }
+        if payment.failure_reason:
+            payload_dict["failure_reason"] = payment.failure_reason
+
+        try:
+            event_rec = WebhookEvent(
+                event_id=event_id,
+                gateway=MockPaymentGateway.GATEWAY_NAME,
+                event_type=event_type,
+                payment_id=payment.id,
+                transaction_reference=payment.transaction_reference,
+                signature_verified=True,
+                processing_status="processed",
+                payload=payload_dict,
+                processed_at=now,
+            )
+            db.add(event_rec)
+            db.flush()
+            db.add(
+                AuditLog(
+                    entity_type="webhook_event",
+                    entity_id=event_rec.id,
+                    action="webhook.processed",
+                    actor=actor,
+                    customer_id=invoice.customer_id,
+                    old_values=None,
+                    new_values={
+                        "event_id": event_rec.event_id,
+                        "event_type": event_rec.event_type,
+                        "payment_id": payment.id,
+                        "processing_status": "processed",
+                    },
+                    ip_address=ip_address,
+                    description=(
+                        f"Automatically triggered webhook event '{event_rec.event_id}' ({event_rec.event_type}) "
+                        f"for payment '{payment.transaction_reference}'."
+                    ),
+                )
+            )
+            db.commit()
+            return event_rec
+        except Exception as exc:
+            db.rollback()
+            logger.warning("Automatic webhook dispatch failed for payment %s: %s", payment.id, exc)
+            return None
+
+    @staticmethod
+    def _trigger_automatic_refund_webhook(
+        db: Session,
+        payment: Payment,
+        refund: PaymentRefund,
+        invoice: Invoice,
+        actor: str = "refund_processor",
+        ip_address: Optional[str] = None,
+    ) -> Optional[WebhookEvent]:
+        """
+        Automatically records and dispatches a verified payment_refunded webhook event after refund completion.
+        Runs safely in its own try/except so that any error in webhook recording NEVER rolls back
+        or corrupts the already committed refund transaction.
+        """
+        if refund.status != RefundStatus.SUCCEEDED:
+            return None
+
+        event_type = MockWebhookEventType.PAYMENT_REFUNDED.value
+        event_id = f"EVT-AUTO-{uuid.uuid4().hex[:12].upper()}"
+        now = datetime.now(timezone.utc)
+        payload_dict = {
+            "event_id": event_id,
+            "event_type": event_type,
+            "transaction_reference": payment.transaction_reference,
+            "refund_reference": refund.refund_reference,
+            "amount": str(refund.amount),
+            "currency": refund.currency,
+            "status": refund.status.value,
+            "gateway_data": refund.gateway_response or {},
+        }
+        if refund.reason:
+            payload_dict["reason"] = refund.reason
+
+        try:
+            event_rec = WebhookEvent(
+                event_id=event_id,
+                gateway=MockPaymentGateway.GATEWAY_NAME,
+                event_type=event_type,
+                payment_id=payment.id,
+                transaction_reference=payment.transaction_reference,
+                signature_verified=True,
+                processing_status="processed",
+                payload=payload_dict,
+                processed_at=now,
+            )
+            db.add(event_rec)
+            db.flush()
+            db.add(
+                AuditLog(
+                    entity_type="webhook_event",
+                    entity_id=event_rec.id,
+                    action="webhook.processed",
+                    actor=actor,
+                    customer_id=invoice.customer_id,
+                    old_values=None,
+                    new_values={
+                        "event_id": event_rec.event_id,
+                        "event_type": event_rec.event_type,
+                        "payment_id": payment.id,
+                        "refund_id": refund.id,
+                        "processing_status": "processed",
+                    },
+                    ip_address=ip_address,
+                    description=(
+                        f"Automatically triggered webhook event '{event_rec.event_id}' ({event_rec.event_type}) "
+                        f"for refund '{refund.refund_reference}'."
+                    ),
+                )
+            )
+            db.commit()
+            return event_rec
+        except Exception as exc:
+            db.rollback()
+            logger.warning("Automatic refund webhook dispatch failed for refund %s: %s", refund.id, exc)
+            return None
 
     @staticmethod
     def list_payments(
@@ -596,7 +826,11 @@ class PaymentService:
         status: Optional[PaymentStatus] = None,
         payment_method: Optional[PaymentMethod] = None,
     ) -> Tuple[List[Payment], int]:
-        query = db.query(Payment).options(selectinload(Payment.refunds))
+        query = db.query(Payment).options(
+            selectinload(Payment.refunds),
+            selectinload(Payment.invoice),
+            selectinload(Payment.customer),
+        )
         if customer_id is not None:
             query = query.filter(Payment.customer_id == customer_id)
         if invoice_id is not None:
@@ -619,7 +853,11 @@ class PaymentService:
     def get_payment(db: Session, payment_id: int) -> Payment:
         payment = (
             db.query(Payment)
-            .options(selectinload(Payment.refunds))
+            .options(
+                selectinload(Payment.refunds),
+                selectinload(Payment.invoice),
+                selectinload(Payment.customer),
+            )
             .filter(Payment.id == payment_id)
             .first()
         )
@@ -660,7 +898,10 @@ def _build_duplicate_webhook_response(db: Session, existing: WebhookEvent) -> We
             if invoice is not None:
                 invoice_status = invoice.status
 
-    if existing.event_type.startswith("refund.") and isinstance(existing.payload, dict):
+    if (
+        existing.event_type.startswith("refund.")
+        or existing.event_type == MockWebhookEventType.PAYMENT_REFUNDED.value
+    ) and isinstance(existing.payload, dict):
         refund_ref = existing.payload.get("refund_reference")
         if refund_ref:
             refund_obj = (
@@ -714,7 +955,9 @@ class WebhookService:
         now = datetime.now(timezone.utc)
         if payload.event_type in (
             MockWebhookEventType.PAYMENT_SUCCEEDED,
+            MockWebhookEventType.PAYMENT_SUCCESS,
             MockWebhookEventType.PAYMENT_FAILED,
+            MockWebhookEventType.PAYMENT_FAILED_UNDERSCORE,
         ):
             return WebhookService._process_payment_webhook(
                 db=db,
@@ -727,6 +970,7 @@ class WebhookService:
 
         if payload.event_type in (
             MockWebhookEventType.REFUND_SUCCEEDED,
+            MockWebhookEventType.PAYMENT_REFUNDED,
             MockWebhookEventType.REFUND_FAILED,
         ):
             return WebhookService._process_refund_webhook(
@@ -895,7 +1139,10 @@ class WebhookService:
             )
 
         # 6. Dispatch supported Stage 3 event transitions
-        if payload.event_type == MockWebhookEventType.PAYMENT_SUCCEEDED:
+        if payload.event_type in (
+            MockWebhookEventType.PAYMENT_SUCCEEDED,
+            MockWebhookEventType.PAYMENT_SUCCESS,
+        ):
             if payment.status == PaymentStatus.PENDING:
                 remaining_balance = _quantize_money(invoice.total_amount - invoice.amount_paid)
                 if invoice.status != InvoiceStatus.OPEN or payment.amount > remaining_balance:
@@ -1017,6 +1264,7 @@ class WebhookService:
 
                 db.refresh(payment)
                 db.refresh(invoice)
+                sub_rec = db.get(Subscription, invoice.subscription_id) if invoice.subscription_id else None
                 return WebhookProcessResponse(
                     event_id=event_rec.event_id,
                     event_type=event_rec.event_type,
@@ -1026,6 +1274,8 @@ class WebhookService:
                     payment_status=payment.status,
                     invoice_id=invoice.id,
                     invoice_status=invoice.status,
+                    subscription_id=sub_rec.id if sub_rec else None,
+                    subscription_status=sub_rec.status.value if sub_rec else None,
                     message=f"Payment '{payment.transaction_reference}' settled successfully.",
                 )
 
@@ -1041,7 +1291,10 @@ class WebhookService:
                 now=now,
             )
 
-        if payload.event_type == MockWebhookEventType.PAYMENT_FAILED:
+        if payload.event_type in (
+            MockWebhookEventType.PAYMENT_FAILED,
+            MockWebhookEventType.PAYMENT_FAILED_UNDERSCORE,
+        ):
             if payment.status == PaymentStatus.PENDING:
                 old_payment = _serialize_payment(payment)
                 payment.status = PaymentStatus.FAILED
@@ -1056,6 +1309,36 @@ class WebhookService:
                     "failed_at": now.isoformat(),
                     **({"gateway_data": payload.gateway_data} if payload.gateway_data else {}),
                 }
+
+                # Failed payment: subscription transitions from Active to Past Due
+                sub_rec = None
+                sub_audit = None
+                if invoice.subscription_id:
+                    sub_rec = (
+                        db.query(Subscription)
+                        .filter(Subscription.id == invoice.subscription_id)
+                        .populate_existing()
+                        .with_for_update()
+                        .first()
+                    )
+                    if sub_rec is not None and sub_rec.status == SubscriptionStatus.ACTIVE:
+                        old_sub = _serialize_subscription(sub_rec)
+                        sub_rec.status = SubscriptionStatus.PAST_DUE
+                        db.flush()
+                        sub_audit = AuditLog(
+                            entity_type="subscription",
+                            entity_id=sub_rec.id,
+                            action="subscription.past_due",
+                            actor=actor,
+                            customer_id=sub_rec.customer_id,
+                            old_values=old_sub,
+                            new_values=_serialize_subscription(sub_rec),
+                            ip_address=ip_address,
+                            description=(
+                                f"Subscription '{sub_rec.subscription_code}' transitioned to 'past_due' "
+                                f"due to failed payment '{payment.transaction_reference}' via webhook '{payload.event_id}'."
+                            ),
+                        )
 
                 event_rec = WebhookEvent(
                     event_id=payload.event_id,
@@ -1072,40 +1355,41 @@ class WebhookService:
 
                 try:
                     db.flush()
-                    db.add_all(
-                        [
-                            AuditLog(
-                                entity_type="payment",
-                                entity_id=payment.id,
-                                action="payment.failed",
-                                actor=actor,
-                                customer_id=invoice.customer_id,
-                                old_values=old_payment,
-                                new_values=_serialize_payment(payment),
-                                ip_address=ip_address,
-                                description=(
-                                    f"Marked pending payment '{payment.transaction_reference}' as failed "
-                                    f"via webhook '{payload.event_id}': {payment.failure_reason}"
-                                ),
+                    audit_entries = [
+                        AuditLog(
+                            entity_type="payment",
+                            entity_id=payment.id,
+                            action="payment.failed",
+                            actor=actor,
+                            customer_id=invoice.customer_id,
+                            old_values=old_payment,
+                            new_values=_serialize_payment(payment),
+                            ip_address=ip_address,
+                            description=(
+                                f"Marked pending payment '{payment.transaction_reference}' as failed "
+                                f"via webhook '{payload.event_id}': {payment.failure_reason}"
                             ),
-                            AuditLog(
-                                entity_type="webhook_event",
-                                entity_id=event_rec.id,
-                                action="webhook.processed",
-                                actor=actor,
-                                customer_id=invoice.customer_id,
-                                old_values=None,
-                                new_values={
-                                    "event_id": event_rec.event_id,
-                                    "event_type": event_rec.event_type,
-                                    "payment_id": payment.id,
-                                    "processing_status": "processed",
-                                },
-                                ip_address=ip_address,
-                                description=f"Processed webhook event '{event_rec.event_id}' ({event_rec.event_type}).",
-                            ),
-                        ]
-                    )
+                        ),
+                        AuditLog(
+                            entity_type="webhook_event",
+                            entity_id=event_rec.id,
+                            action="webhook.processed",
+                            actor=actor,
+                            customer_id=invoice.customer_id,
+                            old_values=None,
+                            new_values={
+                                "event_id": event_rec.event_id,
+                                "event_type": event_rec.event_type,
+                                "payment_id": payment.id,
+                                "processing_status": "processed",
+                            },
+                            ip_address=ip_address,
+                            description=f"Processed webhook event '{event_rec.event_id}' ({event_rec.event_type}).",
+                        ),
+                    ]
+                    if sub_audit is not None:
+                        audit_entries.append(sub_audit)
+                    db.add_all(audit_entries)
                     db.commit()
                 except IntegrityError:
                     db.rollback()
@@ -1129,6 +1413,8 @@ class WebhookService:
                     payment_status=payment.status,
                     invoice_id=invoice.id,
                     invoice_status=invoice.status,
+                    subscription_id=sub_rec.id if sub_rec else None,
+                    subscription_status=sub_rec.status.value if sub_rec else None,
                     message=f"Payment '{payment.transaction_reference}' marked as failed.",
                 )
 
@@ -1156,19 +1442,31 @@ class WebhookService:
         ip_address: Optional[str],
         now: datetime,
     ) -> WebhookProcessResponse:
-        refund_meta = (
-            db.query(PaymentRefund.id, PaymentRefund.payment_id, PaymentRefund.invoice_id)
-            .filter(PaymentRefund.refund_reference == payload.refund_reference)
-            .first()
-        )
+        refund_meta = None
+        if payload.refund_reference:
+            refund_meta = (
+                db.query(PaymentRefund.id, PaymentRefund.payment_id, PaymentRefund.invoice_id)
+                .filter(PaymentRefund.refund_reference == payload.refund_reference)
+                .first()
+            )
+        elif payload.transaction_reference:
+            refund_meta = (
+                db.query(PaymentRefund.id, PaymentRefund.payment_id, PaymentRefund.invoice_id)
+                .join(Payment, Payment.id == PaymentRefund.payment_id)
+                .filter(Payment.transaction_reference == payload.transaction_reference)
+                .order_by(PaymentRefund.id.desc())
+                .first()
+            )
+
         if refund_meta is None:
+            target_ref = payload.refund_reference or payload.transaction_reference
             return WebhookService._record_missing_target(
                 db=db,
                 payload=payload,
                 raw_payload_dict=raw_payload_dict,
-                target_ref=payload.transaction_reference or payload.refund_reference,
+                target_ref=target_ref,
                 action="webhook.refund_not_found",
-                error_message=f"Refund with refund_reference '{payload.refund_reference}' not found.",
+                error_message=f"Refund target '{target_ref}' not found.",
                 actor=actor,
                 ip_address=ip_address,
                 now=now,
@@ -1259,7 +1557,10 @@ class WebhookService:
                 exc_cls=InvalidPaymentOperationError,
             )
 
-        if payload.event_type == MockWebhookEventType.REFUND_SUCCEEDED:
+        if payload.event_type in (
+            MockWebhookEventType.REFUND_SUCCEEDED,
+            MockWebhookEventType.PAYMENT_REFUNDED,
+        ):
             if refund.status == RefundStatus.PENDING:
                 new_refunded_total = _quantize_money(payment.refunded_amount + refund.amount)
                 if payment.status != PaymentStatus.SUCCEEDED or new_refunded_total > payment.amount:

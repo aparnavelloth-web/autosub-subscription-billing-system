@@ -1,6 +1,7 @@
 import json
 from typing import Any, Dict, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi.encoders import jsonable_encoder
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 from app.database.session import get_db
@@ -16,6 +17,16 @@ from app.services.payment_service import (
 router = APIRouter()
 
 
+@router.post(
+    "/payment",
+    response_model=WebhookProcessResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Receive Payment Webhook",
+    description=(
+        "Verifies HMAC-SHA256 `X-Mock-Signature` (`t=<unix_ts>,v1=<hex_hmac>`) against exact raw "
+        "request bytes and idempotently processes payment and refund webhook events."
+    ),
+)
 @router.post(
     "/mock-payment",
     response_model=WebhookProcessResponse,
@@ -51,7 +62,7 @@ async def handle_mock_payment_webhook(
         if not isinstance(raw_payload_dict, dict):
             raise ValueError("Webhook payload must be a JSON object.")
         payload = MockWebhookPayload.model_validate(raw_payload_dict)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid webhook JSON payload: {exc}",
@@ -59,7 +70,12 @@ async def handle_mock_payment_webhook(
     except ValidationError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=exc.errors(),
+            detail=jsonable_encoder(exc.errors()),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid webhook payload: {exc}",
         ) from exc
 
     client_ip = request.client.host if request.client else None

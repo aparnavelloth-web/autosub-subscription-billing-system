@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { invoiceService } from '../services/invoices';
+import { paymentsService } from '../services/payments';
 import InvoiceDetailModal from './InvoiceDetailModal';
 
 export default function InvoicesManager() {
@@ -21,6 +22,8 @@ export default function InvoicesManager() {
   const [selectedInvoice, setSelectedInvoice] = useState(null);
   const [isDetailOpen, setIsDetailOpen] = useState(false);
   const [downloadingId, setDownloadingId] = useState(null);
+  const [processingId, setProcessingId] = useState(null);
+  const [paymentFeedback, setPaymentFeedback] = useState(null);
 
   const fetchInvoices = useCallback(async () => {
     try {
@@ -80,6 +83,44 @@ export default function InvoicesManager() {
     }
   };
 
+  const handleProcessPayment = async (inv, e) => {
+    e.stopPropagation();
+    if (processingId) return;
+
+    try {
+      setProcessingId(inv.id);
+      setPaymentFeedback(null);
+      const res = await paymentsService.processPayment({ invoice_id: inv.id });
+
+      if (res.status === 'succeeded') {
+        setPaymentFeedback({
+          type: 'success',
+          message: `Payment successful! Transaction reference: ${res.transaction_reference}. Invoice ${inv.invoice_number} settled.`,
+        });
+      } else if (res.status === 'failed') {
+        setPaymentFeedback({
+          type: 'error',
+          message: `Payment failed: ${res.failure_reason || 'Gateway simulation declined charge'}. Associated subscription updated to Past Due.`,
+        });
+      } else {
+        setPaymentFeedback({
+          type: 'info',
+          message: `Payment recorded with status '${res.status}'. Reference: ${res.transaction_reference}.`,
+        });
+      }
+
+      // Re-fetch fresh invoice data directly from backend
+      await fetchInvoices();
+    } catch (err) {
+      setPaymentFeedback({
+        type: 'error',
+        message: err.message || 'Payment processing failed.',
+      });
+    } finally {
+      setProcessingId(null);
+    }
+  };
+
   return (
     <div className="invoices-manager-container">
       {/* Module Title & Stats Header */}
@@ -101,6 +142,27 @@ export default function InvoicesManager() {
           </button>
         </div>
       </div>
+
+      {/* Payment Processing Feedback Alert */}
+      {paymentFeedback && (
+        <div
+          className={`auth-alert ${paymentFeedback.type === 'success' ? 'success' : 'error'}`}
+          style={{ marginBottom: '1.5rem', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+            <span>{paymentFeedback.type === 'success' ? '✓' : '⚠️'}</span>
+            <span>{paymentFeedback.message}</span>
+          </div>
+          <button
+            type="button"
+            className="btn-secondary"
+            onClick={() => setPaymentFeedback(null)}
+            style={{ padding: '0.2rem 0.6rem', fontSize: '0.75rem', marginLeft: '1rem' }}
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {/* Filter & Search Toolbar */}
       <div className="invoices-toolbar">
@@ -299,6 +361,19 @@ export default function InvoicesManager() {
 
                       <td>
                         <div className="table-actions" onClick={(e) => e.stopPropagation()}>
+                          {!isPaid && (
+                            <button
+                              type="button"
+                              className="btn-primary table-btn"
+                              style={{ background: '#10b981', borderColor: '#059669' }}
+                              onClick={(e) => handleProcessPayment(inv, e)}
+                              disabled={processingId === inv.id}
+                              title="Process payment via Mock Payment Gateway"
+                            >
+                              {processingId === inv.id ? 'Paying...' : '💳 Pay'}
+                            </button>
+                          )}
+
                           <button
                             type="button"
                             className="btn-secondary table-btn"
@@ -365,6 +440,9 @@ export default function InvoicesManager() {
         onClose={() => {
           setIsDetailOpen(false);
           setSelectedInvoice(null);
+        }}
+        onPaymentCompleted={async () => {
+          await fetchInvoices();
         }}
       />
     </div>

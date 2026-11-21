@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 import hashlib
 import hmac
+import random
 from typing import Any, Dict, Optional
 import uuid
 from app.core.config import settings
@@ -41,6 +42,20 @@ class MockPaymentGateway:
     """
 
     GATEWAY_NAME = "mock_gateway"
+    SUCCESS_PROBABILITY: float = 0.80
+
+    @classmethod
+    def determine_automatic_outcome(
+        cls,
+        random_value: Optional[float] = None,
+    ) -> MockPaymentOutcome:
+        """
+        Calculates payment outcome automatically based on 80% success / 20% failure probability.
+        Allows injecting random_value (float 0.0 to 1.0) or mocking random.random for unit testing.
+        Returns MockPaymentOutcome.SUCCEED if val < 0.80, else MockPaymentOutcome.FAIL.
+        """
+        val = random_value if random_value is not None else random.random()
+        return MockPaymentOutcome.SUCCEED if val < cls.SUCCESS_PROBABILITY else MockPaymentOutcome.FAIL
 
     @staticmethod
     def generate_transaction_reference() -> str:
@@ -68,6 +83,9 @@ class MockPaymentGateway:
         """
         now = datetime.now(timezone.utc)
         txn_ref = transaction_reference or cls.generate_transaction_reference()
+
+        if outcome == MockPaymentOutcome.AUTO:
+            outcome = cls.determine_automatic_outcome()
 
         if outcome == MockPaymentOutcome.SUCCEED:
             auth_code = f"AUTH-{uuid.uuid4().hex[:8].upper()}"

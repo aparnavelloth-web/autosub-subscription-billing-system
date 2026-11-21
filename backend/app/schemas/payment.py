@@ -12,14 +12,21 @@ class MockPaymentOutcome(str, enum.Enum):
     SUCCEED = "succeed"
     FAIL = "fail"
     PENDING = "pending"
+    AUTO = "auto"
 
 
 class MockWebhookEventType(str, enum.Enum):
     """Supported mock gateway webhook event types."""
+    # Dot-notated event names (existing/legacy)
     PAYMENT_SUCCEEDED = "payment.succeeded"
     PAYMENT_FAILED = "payment.failed"
     REFUND_SUCCEEDED = "refund.succeeded"
     REFUND_FAILED = "refund.failed"
+
+    # Underscore-notated event names (Milestone 2 Task 3)
+    PAYMENT_SUCCESS = "payment_success"
+    PAYMENT_FAILED_UNDERSCORE = "payment_failed"
+    PAYMENT_REFUNDED = "payment_refunded"
 
 
 class PaymentBase(BaseModel):
@@ -109,6 +116,82 @@ class PaymentInitiateRequest(BaseModel):
         None,
         max_length=500,
         description="Optional custom reason when simulating a failed or pending payment",
+    )
+
+    @field_validator("currency")
+    @classmethod
+    def validate_currency(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        return normalize_iso_currency(v)
+
+    @field_validator("idempotency_key", "transaction_reference")
+    @classmethod
+    def strip_optional_tokens(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        cleaned = v.strip()
+        if not cleaned:
+            raise ValueError("Identifier cannot be empty or whitespace only.")
+        return cleaned
+
+
+class PaymentProcessRequest(BaseModel):
+    """
+    Request schema specifically for POST /payments/process (Milestone 2 Task 3).
+    Accepts invoice_id and amount (defaults to invoice remaining balance if omitted).
+    Simulates outcome with 80% success / 20% failure probability automatically.
+    Outcome can be deterministically tested via random_value or simulate_outcome.
+    """
+    invoice_id: int = Field(..., gt=0, description="Target OPEN invoice ID")
+    amount: Optional[Decimal] = Field(
+        None,
+        gt=Decimal("0.00"),
+        max_digits=12,
+        decimal_places=2,
+        description="Payment amount (defaults to remaining invoice balance if omitted)",
+    )
+    currency: Optional[str] = Field(
+        None,
+        min_length=3,
+        max_length=3,
+        description="3-letter ISO currency code (must match invoice currency if provided)",
+    )
+    customer_id: Optional[int] = Field(
+        None,
+        gt=0,
+        description="Optional customer ID (validated against invoice owner if provided)",
+    )
+    payment_method: PaymentMethod = Field(
+        default=PaymentMethod.SIMULATED,
+        description="Payment instrument used for settlement",
+    )
+    transaction_reference: Optional[str] = Field(
+        None,
+        min_length=2,
+        max_length=100,
+        description="Optional unique transaction reference (auto-generated if omitted)",
+    )
+    idempotency_key: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=100,
+        description="Optional client idempotency key for safe retries",
+    )
+    simulate_outcome: Optional[MockPaymentOutcome] = Field(
+        None,
+        description="Optional outcome override ('succeed', 'fail', 'pending'). If omitted, auto-simulates 80/20.",
+    )
+    failure_reason: Optional[str] = Field(
+        None,
+        max_length=500,
+        description="Optional custom failure reason when simulating a failed payment",
+    )
+    random_value: Optional[float] = Field(
+        None,
+        ge=0.0,
+        lt=1.0,
+        description="Injectable random float in [0.0, 1.0) for testing 80/20 outcome simulation (< 0.8 -> succeed, >= 0.8 -> fail)",
     )
 
     @field_validator("currency")
@@ -239,6 +322,9 @@ class PaymentResponse(PaymentBase):
     refunds: List[PaymentRefundResponse] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
+    invoice_number: Optional[str] = None
+    customer_name: Optional[str] = None
+    customer_email: Optional[str] = None
 
 
 class MockWebhookPayload(BaseModel):
@@ -289,12 +375,23 @@ class MockWebhookPayload(BaseModel):
 
     @model_validator(mode="after")
     def validate_reference_requirements(self) -> "MockWebhookPayload":
-        if self.event_type in (MockWebhookEventType.PAYMENT_SUCCEEDED, MockWebhookEventType.PAYMENT_FAILED):
+        if self.event_type in (
+            MockWebhookEventType.PAYMENT_SUCCEEDED,
+            MockWebhookEventType.PAYMENT_FAILED,
+            MockWebhookEventType.PAYMENT_SUCCESS,
+            MockWebhookEventType.PAYMENT_FAILED_UNDERSCORE,
+        ):
             if not self.transaction_reference:
                 raise ValueError(f"transaction_reference is required for '{self.event_type.value}' events.")
-        elif self.event_type in (MockWebhookEventType.REFUND_SUCCEEDED, MockWebhookEventType.REFUND_FAILED):
-            if not self.refund_reference:
-                raise ValueError(f"refund_reference is required for '{self.event_type.value}' events.")
+        elif self.event_type in (
+            MockWebhookEventType.REFUND_SUCCEEDED,
+            MockWebhookEventType.REFUND_FAILED,
+            MockWebhookEventType.PAYMENT_REFUNDED,
+        ):
+            if not self.refund_reference and not self.transaction_reference:
+                raise ValueError(
+                    f"refund_reference or transaction_reference is required for '{self.event_type.value}' events."
+                )
         return self
 
 
@@ -310,5 +407,7 @@ class WebhookProcessResponse(BaseModel):
     refund_status: Optional[RefundStatus] = None
     invoice_id: Optional[int] = None
     invoice_status: Optional[InvoiceStatus] = None
+    subscription_id: Optional[int] = None
+    subscription_status: Optional[str] = None
     message: str
 

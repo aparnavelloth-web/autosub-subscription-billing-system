@@ -128,6 +128,18 @@ class Payment(Base):
         remaining = (self.amount or Decimal("0.00")) - (self.refunded_amount or Decimal("0.00"))
         return max(Decimal("0.00"), remaining)
 
+    @property
+    def invoice_number(self) -> Optional[str]:
+        return self.invoice.invoice_number if self.invoice else None
+
+    @property
+    def customer_name(self) -> Optional[str]:
+        return self.customer.full_name if self.customer else None
+
+    @property
+    def customer_email(self) -> Optional[str]:
+        return self.customer.email if self.customer else None
+
     def __repr__(self) -> str:
         return (
             f"<Payment(id={self.id}, ref='{self.transaction_reference}', "

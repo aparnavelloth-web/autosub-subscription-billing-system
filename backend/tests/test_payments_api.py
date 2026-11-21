@@ -10,7 +10,7 @@ import uuid
 from unittest.mock import patch
 import pytest
 from app.models import AuditLog, Customer, Invoice, InvoiceStatus, Payment, PaymentMethod, PaymentStatus
-from app.schemas.payment import PaymentInitiateRequest
+from app.schemas.payment import PaymentInitiateRequest, PaymentProcessRequest
 from app.services.invoice_service import InvoiceNotFoundError
 from app.services.mock_payment_gateway import MockPaymentGateway, MockPaymentOutcome
 from app.services.payment_service import (
@@ -588,4 +588,138 @@ def test_payment_transaction_rollback_on_failure(session_factory):
         )
     finally:
         db_verify.close()
+
+
+def test_mock_payment_gateway_80_20_probability_distribution():
+    # Injectable float testing
+    assert MockPaymentGateway.determine_automatic_outcome(0.00) == MockPaymentOutcome.SUCCEED
+    assert MockPaymentGateway.determine_automatic_outcome(0.50) == MockPaymentOutcome.SUCCEED
+    assert MockPaymentGateway.determine_automatic_outcome(0.7999) == MockPaymentOutcome.SUCCEED
+    assert MockPaymentGateway.determine_automatic_outcome(0.80) == MockPaymentOutcome.FAIL
+    assert MockPaymentGateway.determine_automatic_outcome(0.99) == MockPaymentOutcome.FAIL
+
+    # Mocking random.random
+    with patch("random.random", return_value=0.15):
+        assert MockPaymentGateway.determine_automatic_outcome() == MockPaymentOutcome.SUCCEED
+    with patch("random.random", return_value=0.85):
+        assert MockPaymentGateway.determine_automatic_outcome() == MockPaymentOutcome.FAIL
+
+
+def test_process_payment_endpoint_automatic_success_and_invoice_paid(api_client, db_session):
+    _, invoice = _seed_customer_and_invoice(db_session, total_amount=Decimal("120.00"))
+
+    # Test via top-level endpoint POST /payments/process with mocked random < 0.80
+    with patch("random.random", return_value=0.25):
+        res = api_client.post(
+            "/payments/process",
+            json={"invoice_id": invoice.id, "amount": "120.00"},
+        )
+    assert res.status_code == 201
+    body = res.json()
+    assert body["status"] == "succeeded"
+    assert body["transaction_reference"].startswith("TXN-")
+    assert body["amount"] == "120.00"
+    assert body["payment_date"] is not None
+    assert body["gateway_response"]["simulated"] is True
+    assert body["gateway_response"]["outcome"] == "succeeded"
+
+    db_session.refresh(invoice)
+    assert invoice.status == InvoiceStatus.PAID
+    assert invoice.amount_paid == Decimal("120.00")
+    assert invoice.paid_at is not None
+
+
+def test_process_payment_endpoint_automatic_failure_leaves_invoice_open(api_client, db_session):
+    _, invoice = _seed_customer_and_invoice(db_session, total_amount=Decimal("200.00"))
+
+    # Test via /api/v1/payments/process with mocked random >= 0.80
+    with patch("random.random", return_value=0.90):
+        res = api_client.post(
+            "/api/v1/payments/process",
+            json={"invoice_id": invoice.id, "amount": "200.00"},
+        )
+    assert res.status_code == 201
+    body = res.json()
+    assert body["status"] == "failed"
+    assert body["transaction_reference"].startswith("TXN-")
+    assert body["failure_reason"] is not None
+    assert body["payment_date"] is None
+    assert body["gateway_response"]["outcome"] == "failed"
+
+    db_session.refresh(invoice)
+    assert invoice.status == InvoiceStatus.OPEN
+    assert invoice.amount_paid == Decimal("0.00")
+    assert invoice.paid_at is None
+
+
+def test_process_payment_endpoint_injectable_random_value(api_client, db_session):
+    _, invoice = _seed_customer_and_invoice(db_session, total_amount=Decimal("150.00"))
+
+    # Inject random_value=0.05 -> should succeed
+    res_ok = api_client.post(
+        "/payments/process",
+        json={"invoice_id": invoice.id, "amount": "50.00", "random_value": 0.05},
+    )
+    assert res_ok.status_code == 201
+    assert res_ok.json()["status"] == "succeeded"
+
+    db_session.refresh(invoice)
+    assert invoice.status == InvoiceStatus.OPEN
+    assert invoice.amount_paid == Decimal("50.00")
+
+    # Inject random_value=0.95 -> should fail
+    res_fail = api_client.post(
+        "/payments/process",
+        json={"invoice_id": invoice.id, "amount": "50.00", "random_value": 0.95},
+    )
+    assert res_fail.status_code == 201
+    assert res_fail.json()["status"] == "failed"
+
+    db_session.refresh(invoice)
+    assert invoice.amount_paid == Decimal("50.00")
+
+
+def test_process_payment_endpoint_default_amount_to_remaining_balance(api_client, db_session):
+    _, invoice = _seed_customer_and_invoice(db_session, total_amount=Decimal("75.50"))
+
+    # Omit amount completely, with injected success
+    res = api_client.post(
+        "/payments/process",
+        json={"invoice_id": invoice.id, "random_value": 0.10},
+    )
+    assert res.status_code == 201
+    body = res.json()
+    assert body["status"] == "succeeded"
+    assert body["amount"] == "75.50"
+
+    db_session.refresh(invoice)
+    assert invoice.status == InvoiceStatus.PAID
+    assert invoice.amount_paid == Decimal("75.50")
+
+
+def test_process_payment_endpoint_invalid_invoice_and_amount_rejections(api_client, db_session):
+    _, invoice = _seed_customer_and_invoice(db_session, total_amount=Decimal("100.00"))
+
+    # 1. Non-existent invoice
+    res_404 = api_client.post("/payments/process", json={"invoice_id": 999999, "amount": "50.00"})
+    assert res_404.status_code == 404
+
+    # 2. Overpayment (amount > balance)
+    res_over = api_client.post("/payments/process", json={"invoice_id": invoice.id, "amount": "150.00"})
+    assert res_over.status_code == 400
+    assert "exceeds remaining invoice balance" in res_over.json()["detail"]
+
+    # 3. Zero amount
+    res_zero = api_client.post("/payments/process", json={"invoice_id": invoice.id, "amount": "0.00"})
+    assert res_zero.status_code in (400, 422)
+
+    # 4. Settle invoice, then try paying already-paid invoice
+    with patch("random.random", return_value=0.1):
+        res_pay = api_client.post("/payments/process", json={"invoice_id": invoice.id, "amount": "100.00"})
+        assert res_pay.status_code == 201
+
+    res_already_paid = api_client.post("/payments/process", json={"invoice_id": invoice.id, "amount": "10.00"})
+    assert res_already_paid.status_code == 400
+    assert "cannot accept payments in 'paid' status" in res_already_paid.json()["detail"]
+
 

@@ -7,6 +7,7 @@ from app.models.enums import PaymentMethod, PaymentStatus
 from app.schemas.common import PaginatedResponse
 from app.schemas.payment import (
     PaymentInitiateRequest,
+    PaymentProcessRequest,
     PaymentRefundRequest,
     PaymentResponse,
     RefundActionResponse,
@@ -34,6 +35,42 @@ router = APIRouter()
 )
 def create_payment(
     payload: PaymentInitiateRequest,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> PaymentResponse:
+    client_ip = request.client.host if request.client else None
+    try:
+        payment, created = PaymentService.process_payment(
+            db=db,
+            payload=payload,
+            actor="api",
+            ip_address=client_ip,
+        )
+        if not created:
+            response.status_code = status.HTTP_200_OK
+        return PaymentResponse.model_validate(payment)
+    except InvoiceNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except DuplicatePaymentError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except InvalidPaymentOperationError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@router.post(
+    "/process",
+    response_model=PaymentResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Process Invoice Payment with 80/20 Outcome Simulation",
+    description=(
+        "Processes an invoice payment attempt. Automatically simulates outcome with 80% success / "
+        "20% failure probability unless explicitly overridden. Validates invoice, amount, and currency, "
+        "generates a unique transaction ID, persists the payment record, and updates invoice status."
+    ),
+)
+def process_payment(
+    payload: PaymentProcessRequest,
     request: Request,
     response: Response,
     db: Session = Depends(get_db),
