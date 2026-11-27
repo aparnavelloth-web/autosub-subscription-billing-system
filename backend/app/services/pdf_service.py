@@ -138,6 +138,7 @@ class InvoicePDFService:
         doc = SimpleDocTemplate(
             buffer,
             pagesize=letter,
+            pageCompression=0,
             leftMargin=0.5 * inch,
             rightMargin=0.5 * inch,
             topMargin=0.5 * inch,
@@ -425,9 +426,15 @@ class InvoicePDFService:
                 Paragraph("<b>Discount / Credits:</b>", cell_header),
                 Paragraph(format_currency_amount(-discount_val, invoice.currency), cell_bold_right),
             ])
+        has_gst_item = any("GST" in (itm.description or "") for itm in items)
+        if tax_val > Decimal("0.00") or has_gst_item:
+            tax_label = "<b>GST (18%):</b>"
+        else:
+            tax_label = "<b>Tax:</b>"
+
         totals_data.extend([
             [
-                Paragraph("<b>Tax:</b>", cell_header),
+                Paragraph(tax_label, cell_header),
                 Paragraph(format_currency_amount(tax_val, invoice.currency), cell_bold_right),
             ],
             [

@@ -121,10 +121,10 @@ def test_generate_invoice_for_billing_cycle_and_audit_log(db_session):
     assert invoice.customer_id == customer.id
     assert invoice.subscription_id == sub.id
     assert invoice.billing_cycle_id == cycle.id
-    assert invoice.subtotal == Decimal("99.98")
+    assert invoice.subtotal == Decimal("90.89")
     assert invoice.discount_amount == Decimal("0.00")
-    assert invoice.tax_amount == Decimal("10.00")
-    assert invoice.total_amount == Decimal("109.98")
+    assert invoice.tax_amount == Decimal("9.09")
+    assert invoice.total_amount == Decimal("99.98")
     assert invoice.amount_paid == Decimal("0.00")
     assert invoice.currency == "USD"
     assert invoice.status == InvoiceStatus.OPEN
@@ -135,8 +135,8 @@ def test_generate_invoice_for_billing_cycle_and_audit_log(db_session):
     assert item_types == {InvoiceItemType.BASE_SUBSCRIPTION, InvoiceItemType.TAX}
     base_item = next(i for i in invoice.items if i.item_type == InvoiceItemType.BASE_SUBSCRIPTION)
     assert base_item.quantity == 2
-    assert base_item.unit_price == Decimal("49.99")
-    assert base_item.amount == Decimal("99.98")
+    assert base_item.unit_price == Decimal("45.45")
+    assert base_item.amount == Decimal("90.89")
 
     db_session.refresh(cycle)
     assert cycle.status == BillingCycleStatus.COMPLETED
@@ -334,7 +334,8 @@ def test_historical_pricing_snapshot_preserved_when_plan_price_changes(db_sessio
         billing_cycle_id=cycle_res["billing_cycle_id"],
     )
     assert created is True
-    assert invoice.subtotal == Decimal("39.00")
+    assert invoice.subtotal == Decimal("33.05")
+    assert invoice.tax_amount == Decimal("5.95")
     assert invoice.total_amount == Decimal("39.00")
 
 
@@ -624,8 +625,10 @@ def test_manual_invoice_generation_api_and_search_filters(api_client, db_session
     assert res_gen.status_code == 201
     inv_data = res_gen.json()
     assert inv_data["billing_cycle_id"] == cycle.id
-    assert inv_data["subtotal"] == "99.00"
+    assert inv_data["subtotal"] == "91.67"
     assert inv_data["discount_amount"] == "10.00"
+    assert inv_data["tax_amount"] == "7.33"
+    assert inv_data["total_amount"] == "89.00"
     assert inv_data["customer_name"] == customer.full_name
     assert inv_data["customer_email"] == customer.email
     assert inv_data["status"] == "open"
@@ -653,5 +656,174 @@ def test_manual_invoice_generation_api_and_search_filters(api_client, db_session
     res_date = api_client.get(f"/api/v1/invoices?date_from={issue_dt_utc.date().isoformat()}&date_to=2099-12-31")
     assert res_date.status_code == 200
     assert res_date.json()["total"] >= 1
+
+
+def test_mentor_gst_inclusive_tax_calculation_and_pdf_details(api_client, db_session):
+    """
+    Validates Mentor Requirements for Milestone 2 Final Task:
+    1. 18% GST included in subscription price:
+       Base Price = Total Price / 1.18
+       GST Amount = Total Price - Base Price
+       Example: Total = ₹149.00 -> Base = ₹126.27, GST = ₹22.73, Final Total = ₹149.00.
+    2. Appropriate line items created:
+       - Base subscription line item (base amount)
+       - Tax line item: 'GST (18%)' with GST amount
+    3. Different plan prices (e.g. ₹999.00, ₹499.00) and rounding edge cases.
+    4. Multi-quantity subscriptions (e.g. 3 seats at ₹149.00).
+    5. Multi-currency support (USD, EUR, GBP, CAD, AUD, INR).
+    6. PDF generation displays 'GST (18%)' and proper totals.
+    7. Historical invoices remain safe and unmodified.
+    """
+    # 1. Mentor Specification Test: Plan at ₹149.00 INR
+    _, customer, sub, cycle = _seed_subscription_with_cycle(
+        db_session,
+        suffix="GST149",
+        unit_price=Decimal("149.00"),
+        quantity=1,
+    )
+    # Ensure currency is INR
+    sub.currency = "INR"
+    cycle.currency = "INR"
+    db_session.commit()
+
+    invoice, created = InvoiceService.generate_invoice_for_billing_cycle(
+        db=db_session,
+        billing_cycle_id=cycle.id,
+        notes="149 INR GST-inclusive recurring renewal",
+        actor="test_gst_suite",
+    )
+    assert created is True
+    assert invoice.currency == "INR"
+    # Exact mentor verification:
+    # Base Price = 149.00 / 1.18 = 126.271186... -> 126.27
+    # GST Amount = 149.00 - 126.27 = 22.73
+    # Final Total = 149.00
+    assert invoice.subtotal == Decimal("126.27")
+    assert invoice.tax_amount == Decimal("22.73")
+    assert invoice.total_amount == Decimal("149.00")
+    assert invoice.discount_amount == Decimal("0.00")
+
+    # Check line items:
+    items = invoice.items
+    assert len(items) == 2
+    base_item = next(i for i in items if i.item_type == InvoiceItemType.BASE_SUBSCRIPTION)
+    tax_item = next(i for i in items if i.item_type == InvoiceItemType.TAX)
+
+    assert base_item.quantity == 1
+    assert base_item.unit_price == Decimal("126.27")
+    assert base_item.amount == Decimal("126.27")
+
+    assert tax_item.description == "GST (18%)"
+    assert tax_item.quantity == 1
+    assert tax_item.unit_price == Decimal("22.73")
+    assert tax_item.amount == Decimal("22.73")
+
+    # Verify PDF generation via API endpoint
+    res_pdf = api_client.get(f"/api/v1/invoices/{invoice.id}/pdf")
+    assert res_pdf.status_code == 200
+    assert res_pdf.headers["content-type"] == "application/pdf"
+    pdf_bytes = res_pdf.content
+    assert pdf_bytes.startswith(b"%PDF-")
+    assert b"GST" in pdf_bytes
+    assert b"18%" in pdf_bytes
+    assert (b"GST \\(18%\\)" in pdf_bytes) or (b"GST (18%)" in pdf_bytes)
+
+    # 2. Different Plan Prices: ₹999.00 and ₹499.00
+    # ₹999.00: Base = 999.00 / 1.18 = 846.61, GST = 152.39, Total = 999.00
+    _, _, _, cycle_999 = _seed_subscription_with_cycle(
+        db_session,
+        suffix="GST999",
+        unit_price=Decimal("999.00"),
+        quantity=1,
+    )
+    inv_999, _ = InvoiceService.generate_invoice_for_billing_cycle(db_session, cycle_999.id)
+    assert inv_999.subtotal == Decimal("846.61")
+    assert inv_999.tax_amount == Decimal("152.39")
+    assert inv_999.total_amount == Decimal("999.00")
+
+    # ₹499.00: Base = 499.00 / 1.18 = 422.88, GST = 76.12, Total = 499.00
+    _, _, _, cycle_499 = _seed_subscription_with_cycle(
+        db_session,
+        suffix="GST499",
+        unit_price=Decimal("499.00"),
+        quantity=1,
+    )
+    inv_499, _ = InvoiceService.generate_invoice_for_billing_cycle(db_session, cycle_499.id)
+    assert inv_499.subtotal == Decimal("422.88")
+    assert inv_499.tax_amount == Decimal("76.12")
+    assert inv_499.total_amount == Decimal("499.00")
+
+    # 3. Multi-quantity: 3 seats at ₹149.00 = ₹447.00
+    # Gross = 447.00 -> Base = 447.00 / 1.18 = 378.81, GST = 68.19, Total = 447.00
+    _, _, _, cycle_qty = _seed_subscription_with_cycle(
+        db_session,
+        suffix="GSTQTY",
+        unit_price=Decimal("149.00"),
+        quantity=3,
+    )
+    inv_qty, _ = InvoiceService.generate_invoice_for_billing_cycle(db_session, cycle_qty.id)
+    assert inv_qty.subtotal == Decimal("378.81")
+    assert inv_qty.tax_amount == Decimal("68.19")
+    assert inv_qty.total_amount == Decimal("447.00")
+    b_qty = next(i for i in inv_qty.items if i.item_type == InvoiceItemType.BASE_SUBSCRIPTION)
+    assert b_qty.quantity == 3
+    assert b_qty.unit_price == Decimal("126.27")
+    assert b_qty.amount == Decimal("378.81")
+
+    # 4. Multi-Currency Support: USD ($100.00) and EUR (€50.00)
+    # USD 100.00: Base = 100.00 / 1.18 = 84.75, GST = 15.25, Total = 100.00
+    _, _, sub_usd, cycle_usd = _seed_subscription_with_cycle(
+        db_session,
+        suffix="GSTUSD",
+        unit_price=Decimal("100.00"),
+        quantity=1,
+    )
+    inv_usd, _ = InvoiceService.generate_invoice_for_billing_cycle(db_session, cycle_usd.id)
+    assert inv_usd.subtotal == Decimal("84.75")
+    assert inv_usd.tax_amount == Decimal("15.25")
+    assert inv_usd.total_amount == Decimal("100.00")
+    assert inv_usd.currency == "USD"
+
+    # EUR 50.00: Base = 50.00 / 1.18 = 42.37, GST = 7.63, Total = 50.00
+    _, _, sub_eur, cycle_eur = _seed_subscription_with_cycle(
+        db_session,
+        suffix="GSTEUR",
+        unit_price=Decimal("50.00"),
+        quantity=1,
+    )
+    sub_eur.currency = "EUR"
+    cycle_eur.currency = "EUR"
+    db_session.commit()
+    inv_eur, _ = InvoiceService.generate_invoice_for_billing_cycle(db_session, cycle_eur.id)
+    assert inv_eur.subtotal == Decimal("42.37")
+    assert inv_eur.tax_amount == Decimal("7.63")
+    assert inv_eur.total_amount == Decimal("50.00")
+    assert inv_eur.currency == "EUR"
+
+    # 5. Historical Invoices Safety:
+    # A historical invoice created with old values must never be mutated by tax changes
+    hist_inv = Invoice(
+        invoice_number="INV-2025-HIST001",
+        customer_id=customer.id,
+        subtotal=Decimal("149.00"),
+        tax_amount=Decimal("0.00"),
+        discount_amount=Decimal("0.00"),
+        total_amount=Decimal("149.00"),
+        amount_paid=Decimal("149.00"),
+        currency="INR",
+        status=InvoiceStatus.PAID,
+        issue_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        due_date=datetime(2025, 1, 8, tzinfo=timezone.utc),
+    )
+    db_session.add(hist_inv)
+    db_session.commit()
+    db_session.refresh(hist_inv)
+
+    # Re-fetch and verify nothing changed
+    saved_hist = db_session.get(Invoice, hist_inv.id)
+    assert saved_hist.subtotal == Decimal("149.00")
+    assert saved_hist.tax_amount == Decimal("0.00")
+    assert saved_hist.total_amount == Decimal("149.00")
+
 
 

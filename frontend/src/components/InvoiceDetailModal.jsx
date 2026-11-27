@@ -105,9 +105,26 @@ export default function InvoiceDetailModal({ invoice, isOpen, onClose, onPayment
               <p className="modal-subtitle">Itemized tax billing statement details</p>
             </div>
           </div>
-          <button className="modal-close-btn" onClick={onClose} aria-label="Close modal">
-            &times;
-          </button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <button
+              type="button"
+              className="btn-primary"
+              style={{ padding: '0.4rem 0.85rem', fontSize: '0.8rem', display: 'flex', alignItems: 'center', gap: '0.4rem' }}
+              onClick={handleDownloadPdf}
+              disabled={downloading}
+              title="Download official PDF invoice"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="7 10 12 15 17 10" />
+                <line x1="12" x2="12" y1="15" y2="3" />
+              </svg>
+              {downloading ? 'Downloading...' : 'Download PDF ↓'}
+            </button>
+            <button className="modal-close-btn" onClick={onClose} aria-label="Close modal">
+              &times;
+            </button>
+          </div>
         </div>
 
         {downloadError && (
@@ -234,7 +251,7 @@ export default function InvoiceDetailModal({ invoice, isOpen, onClose, onPayment
                 </div>
               )}
               <div className="invoice-tot-row">
-                <span>Tax:</span>
+                <span>GST (18%):</span>
                 <span>{currentInvoice.currency} {tax}</span>
               </div>
               <div className="invoice-tot-row grand-total">

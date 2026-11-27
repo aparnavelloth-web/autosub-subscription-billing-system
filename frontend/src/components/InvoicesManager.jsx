@@ -380,7 +380,7 @@ export default function InvoicesManager() {
                             onClick={() => handleViewDetails(inv)}
                             title="Inspect itemized line items"
                           >
-                            Details
+                            View
                           </button>
 
                           <button

@@ -52,7 +52,7 @@ class Settings(BaseSettings):
 
     # Billing & Invoicing Defaults
     DEFAULT_CURRENCY: str = "INR"
-    DEFAULT_TAX_RATE: Decimal = Decimal("0.00")
+    DEFAULT_TAX_RATE: Decimal = Decimal("0.18")
     DEFAULT_INVOICE_DUE_DAYS: int = 7
 
     # Mock Payment Gateway & Webhook Security Settings

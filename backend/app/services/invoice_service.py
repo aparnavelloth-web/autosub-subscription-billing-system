@@ -176,23 +176,52 @@ class InvoiceService:
                 f"BillingCycle {billing_cycle_id} has no associated Subscription."
             )
 
-        # Build base subscription charge strictly from subscription's historical pricing snapshot
+        # Build base subscription charge strictly from subscription's historical pricing snapshot.
+        # Pricing is GST-inclusive: Total Plan Price = Base Price + GST (18%).
+        # Base Price = Total Plan Price / (1 + effective_tax_rate)
+        # GST Amount = Total Plan Price - Base Price
         plan_label = sub.plan.name if sub.plan else f"Subscription {sub.subscription_code}"
         period_str = (
             f"{ensure_utc(cycle.period_start).date().isoformat()} to "
             f"{ensure_utc(cycle.period_end).date().isoformat()}"
         )
-        base_amount = _quantize_money(sub.unit_price * sub.quantity)
-        base_item = InvoiceItemCreate(
-            item_type=InvoiceItemType.BASE_SUBSCRIPTION,
-            description=f"{plan_label} ({sub.billing_interval.value}) - {period_str}",
-            quantity=sub.quantity,
-            unit_price=sub.unit_price,
-            amount=base_amount,
-        )
-
-        all_items = [base_item] + list(extra_items or [])
+        gross_total = _quantize_money(sub.unit_price * sub.quantity)
         effective_tax_rate = tax_rate if tax_rate is not None else settings.DEFAULT_TAX_RATE
+
+        if effective_tax_rate > Decimal("0.00"):
+            divisor = Decimal("1.00") + effective_tax_rate
+            base_amount = (gross_total / divisor).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            gst_amount = _quantize_money(gross_total - base_amount)
+            unit_base_price = (base_amount / Decimal(sub.quantity)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+            base_item = InvoiceItemCreate(
+                item_type=InvoiceItemType.BASE_SUBSCRIPTION,
+                description=f"{plan_label} ({sub.billing_interval.value}) - {period_str}",
+                quantity=sub.quantity,
+                unit_price=unit_base_price,
+                amount=base_amount,
+            )
+            pct_val = effective_tax_rate * Decimal("100")
+            pct_str = f"{int(pct_val)}" if pct_val % 1 == 0 else f"{pct_val}"
+            tax_item = InvoiceItemCreate(
+                item_type=InvoiceItemType.TAX,
+                description=f"GST ({pct_str}%)",
+                quantity=1,
+                unit_price=gst_amount,
+                amount=gst_amount,
+            )
+            all_items = [base_item, tax_item] + list(extra_items or [])
+        else:
+            base_amount = gross_total
+            base_item = InvoiceItemCreate(
+                item_type=InvoiceItemType.BASE_SUBSCRIPTION,
+                description=f"{plan_label} ({sub.billing_interval.value}) - {period_str}",
+                quantity=sub.quantity,
+                unit_price=sub.unit_price,
+                amount=base_amount,
+            )
+            all_items = [base_item] + list(extra_items or [])
+
         subtotal, discount_amount, tax_amount, total_amount, finalized_items = (
             InvoiceService.calculate_totals_from_items(
                 items=all_items,
@@ -292,7 +321,7 @@ class InvoiceService:
         if not items:
             raise InvalidInvoiceOperationError("An invoice must contain at least one line item.")
 
-        effective_tax_rate = tax_rate if tax_rate is not None else settings.DEFAULT_TAX_RATE
+        effective_tax_rate = tax_rate if tax_rate is not None else Decimal("0.00")
         subtotal, discount_amount, tax_amount, total_amount, finalized_items = (
             InvoiceService.calculate_totals_from_items(
                 items=items,

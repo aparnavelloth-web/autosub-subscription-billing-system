@@ -341,11 +341,17 @@ class SubscriptionService:
         else:
             change_type = "switch"
 
-        # Estimated Tax on positive net amount due
+        # Estimated Tax on positive net amount due (GST inclusive)
         tax_rate = settings.DEFAULT_TAX_RATE
-        taxable_base = max(Decimal("0.00"), net_amount_due)
-        tax_amount = (taxable_base * tax_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        total_due = max(Decimal("0.00"), net_amount_due + tax_amount)
+        if net_amount_due > Decimal("0.00") and tax_rate > Decimal("0.00"):
+            divisor = Decimal("1.00") + tax_rate
+            taxable_base = (net_amount_due / divisor).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            tax_amount = (net_amount_due - taxable_base).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            total_due = net_amount_due
+        else:
+            taxable_base = max(Decimal("0.00"), net_amount_due)
+            tax_amount = Decimal("0.00")
+            total_due = max(Decimal("0.00"), net_amount_due)
         credit_carried_forward = max(Decimal("0.00"), -net_amount_due)
 
         current_plan_name = subscription.plan.name if subscription.plan else f"Plan {subscription.plan_id}"
@@ -539,6 +545,7 @@ class SubscriptionService:
             subscription_id=subscription.id,
             items=items,
             currency=subscription.currency,
+            tax_rate=Decimal("0.00"),
             notes=notes,
             actor=actor,
             commit=False,
